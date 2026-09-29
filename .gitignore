@@ -1,0 +1,4 @@
+.venv/
+out/
+out2/
+__pycache__/

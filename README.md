@@ -1,91 +1,154 @@
-# 文档蒸馏流水线（doc-distill）
+# Document Distillation Pipeline
 
-> **读一遍，用一辈子**：把文档蒸馏成结构化知识卡，之后每个场景按模板秒出定制内容。
+**Turn any long technical document into a structured knowledge base once — then render task-specific outputs from templates, without re-reading the source.**
 
-## 为什么做这个
+![Distillation results](results/distillation_results.png)
 
-同一份技术文档，一个月翻了二十遍——客户问翻一遍、新人问翻一遍、写方案翻一遍、做培训翻一遍。
+---
 
-**每次翻，都是在重新理解。** 而让 AI 每次重读文档回答，慢、贵、且结论会漂移。
+## The problem
 
-→ **换个做法**：熬汤 vs 汤块。**熬一次，浓缩成块**，之后按场景冲水即用。
+A single technical document gets re-read dozens of times for different purposes:
 
-## 四步流程
+- a customer asks whether they can parse your protocol → you skim it
+- a newcomer asks what a term means → you skim it again
+- you write a technical proposal → you extract the parameters again
+- the team needs training material → you skim it a third time
+
+Ask an LLM to answer from the document instead, and every request re-reads it: slower, more expensive, and — worse — **the answer drifts between runs**, because nothing is remembered.
+
+**Distillation changes the shape of the work**: understand the document *once*, extract the substance into a structured artefact, then reuse it forever.
+
+---
+
+## Results at a glance
+
+Run on a 4,400-word CAN protocol guide:
+
+| Metric | Value |
+|--------|-------|
+| Semantic chunks | **14** (heading-aware, not fixed-length) |
+| **Structured knowledge items** | **226** |
+| — Concepts | 72 |
+| — Parameters | 38 |
+| — Procedures | 8 |
+| — **Constraints** | **45** |
+| — FAQ | 63 |
+| One-off distillation time | **33.6 s** (parallel extraction) |
+| Scene outputs generated | **4** (newcomer Q&A, customer reply, technical proposal, exam paper) |
+
+The **45 constraints** are the most valuable output — each one carries its *reason*, e.g.
+
+> **Do not treat padding beyond DLC as valid data.**
+> Reason: when DLC = 2 but the data field carries 8 bytes, the last 6 are typically 0 or 0xAA padding. Treating them as data produces wrong results.
+
+---
+
+## How it works
 
 ```
-文档 → [① 切] → [② 炼] → [③ 装] → 知识卡(JSON) → [④ 用:场景模板] → 定制输出
+  document
+     │
+     ▼
+ ① CHUNK ──── semantic, follows the heading hierarchy (1,000–1,500 words each)
+     │
+     ▼
+ ② EXTRACT ── 5 categories in parallel, every item traceable to its source chunk
+     │        concepts · parameters · procedures · constraints · FAQ
+     ▼
+ ③ STRUCTURE ─ fixed JSON schema → ordinary programs can query it
+     │
+     ▼
+ ④ RENDER ─── scenario templates:  same knowledge, different output shape
+              (newcomer Q&A / customer reply / technical proposal / exam)
 ```
 
-| 步骤 | 做什么 | 关键点 |
-|------|--------|--------|
-| **① 切** | 按标题层级切成语义切片 | **不是按字数切**——保证一个概念不被截断；带章节路径便于追溯 |
-| **② 炼** | 抽 5 类结构化知识 | 概念 / 参数 / 流程 / **约束** / FAQ。**约束最值钱**（出事都在这儿）|
-| **③ 装** | 存成固定字段的 JSON | 变成"资产"而非"一份 AI 生成的文字"，程序可直接调 |
-| **④ 用** | 场景模板渲染 | 同一份知识 → 新人版/客户版/方案版/考卷版 |
+**Why it scales**: step ② runs once. Steps ④ reuse the artefact — no source re-reading, no per-request drift, and the output shape is controlled by a template rather than a prompt.
 
-## 实测数据（4400 字文档）
+---
 
-| 环节 | 耗时 | 产出 |
-|------|------|------|
-| **蒸馏（一次性）** | **33.6s** | **226 条知识**（概念 72 / 参数 38 / 流程 8 / 约束 45 / FAQ 63）|
-| 场景：新人问答 | 20s | ~1000 字白话解释 |
-| 场景：客户答疑 | 9s | ~300 字结论先行 |
-| 场景：技术方案 | 70s | ~3000 字参数清单（带出处）|
-| 场景：培训考卷 | 24s | ~1900 字题目 + 解析（含答案）|
+## Why not just "ask the LLM about the document"?
 
-**蒸馏成本只付一次**，之后每换场景都只是"读结构化知识 + 按模板写"。
+| | Ask the LLM each time | Distilled once |
+|--|----------------------|----------------|
+| Cost per question | Full document in context | Only the matched items |
+| Latency | Grows with document size | Small and flat |
+| **Consistency** | **Drifts between runs** | **Deterministic artefact** |
+| Multi-scenario reuse | Re-derive each time | Template swap |
+| Traceability | Usually none | Every item carries its source chunk |
 
-## 用法
+---
+
+## Engineering findings
+
+These came up while building it and shaped the final design.
+
+**1. Quality-sensitive stages must not use cheap models.**
+Routing the "extract" stage to a free tier lost a critical distinction: the source said *"the transport layer is standardised, the payload is vendor-specific"* and the small model compressed it to *"not standardised"*. Distillation is a one-off investment that every downstream output depends on — a mistake there propagates everywhere.
+
+**2. Reasoning models have a token-budget trap.**
+With `max_tokens` set to 2,500, three of four scene outputs came back **empty** — the model had spent the entire budget on its internal reasoning. The same cause silently cut extraction from 226 items to 58. Fix: give reasoning models a generous budget (8,000–16,000) and detect empty outputs to retry.
+
+**3. Chunking granularity is a real parameter.**
+Too coarse and one chunk covers three topics (extraction goes vague); too fine and a single concept is split across five chunks (each one incomplete). The working range here: **1,000–1,500 words per chunk, aligned to heading boundaries**.
+
+**4. Prompt braces bite.**
+Technical documents contain JSON examples. Braces in a prompt that is later passed through string formatting collide — the first run failed **all 14 chunks** for this reason.
+
+---
+
+## Quick start
 
 ```bash
-uv venv .venv && uv pip install --python .venv/bin/python httpx
-.venv/bin/python distill.py <文档.md> --out out
+python -m venv .venv && source .venv/bin/activate     # or: uv venv .venv
+pip install -r requirements.txt
+
+# Set your API key (any OpenAI-compatible endpoint)
+export DEEPSEEK_API_KEY="sk-..."
+
+python distill.py samples/your-document.md --out out
 ```
 
-产物：
-```
-out/knowledge.json      # 结构化知识卡
-out/scene_newbie.md     # 新人问答
-out/scene_customer.md   # 客户答疑
-out_scene_proposal.md   # 技术方案
-out/scene_exam.md       # 培训考卷
-```
-
-**依赖**：本机 Token 路由代理（`http://127.0.0.1:8787/v1`）——脚本通过 `X-Route: default` 显式声明"质量优先"。
-
-## ⚠️ 四个真坑（实测踩出来的）
-
-### 1. 别让任何环节图便宜
-
-"看起来简单"的环节走了免费小模型 → 把原文"底层通用、上层不通用"**概括成"不通用"**（关键区分丢失）。
-另外一次渲染 3000 字方案走免费池，**跑了 119 秒**（直连十几秒）。
-→ **蒸馏是一次性高价值投入，错了下游全错**。该花的地方别省。
-
-### 2. 推理模型的 token 预算（最坑）
-
-用推理型模型（如 DeepSeek）时：**"思考"也占 token**。
-- 输出上限给 2500 → 思考就用掉 2500 → **正文为空**（4 个场景 3 个空）
-- 同样的坑还导致提炼条数从 226 掉到 58（**提炼过程被截断**，不是内容变少）
-
-→ **token 上限给足（8000-16000）+ 检测空输出自动重试**。
-
-### 3. 切分粒度
-
-太粗 → 一个切片塞多个主题，提炼发糊；太细 → 概念被拆碎，每块不完整。
-→ **经验值：单切片 1000-1500 字，且跟随标题层级**。
-
-### 4. 提示词里的花括号
-
-技术 prompt 常举例 JSON，与代码的字符串格式化 `{}` 冲突 → **14 个切片全部提炼失败**。
-→ 用 `str.replace()` 而非 `.format()`，或转义花括号。
-
-## 目录
+Outputs:
 
 ```
-distill.py          主流程（切分/提炼/渲染）
-out3/               示例产物（226 条知识 + 4 场景输出）
+out/knowledge.json      structured knowledge base (concepts/parameters/…)
+out/scene_newbie.md     newcomer Q&A
+out/scene_customer.md   customer reply
+out/scene_proposal.md   technical proposal
+out/scene_exam.md       training exam
+```
+
+Regenerate the figures:
+
+```bash
+python make_figures.py      # → results/distillation_results.png
 ```
 
 ---
 
-*配套文章：《同样的文档我读了 20 遍，直到我把它"蒸"了一次》*
+## Project structure
+
+```
+doc-distill/
+├── distill.py            # pipeline: chunk → extract → structure → render
+├── make_figures.py       # result figures from the real artefact
+├── samples/              # example artefacts (knowledge.json + 4 scenes)
+├── out3/                 # reference run used for the figures
+├── results/              # generated figures
+├── README.md             # this file
+└── README.zh.md          # Chinese version
+```
+
+---
+
+## Limitations & next steps
+
+- **Extraction quality tracks document quality** — a vague manual yields vague items; the pipeline does not invent missing structure.
+- **No incremental update yet** — changing the source means re-distilling. A diff-based update (only re-extract changed chunks) is the obvious next step.
+- **Retrieval is lexical** for the scene templates; swapping in embeddings would help on very large knowledge bases.
+- **Evaluation is manual** — a rubric-based automatic scoring pass would make regressions visible.
+
+---
+
+*Built as a study of LLM-based information extraction: one-shot investment, reusable artefact. MIT licensed.*
